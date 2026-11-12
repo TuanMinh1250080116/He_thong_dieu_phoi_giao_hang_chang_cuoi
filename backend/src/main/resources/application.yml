@@ -1,0 +1,76 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: logistics
+  datasource:
+    url: jdbc:postgresql://localhost:5432/logistics
+    username: logistics
+    password: logistics
+  mail:
+    host: localhost
+    port: 1025
+    properties:
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 5000
+      mail.smtp.writetimeout: 5000
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: logistics
+    password: logistics
+    publisher-confirm-type: simple
+    listener:
+      simple:
+        default-requeue-rejected: false
+        retry:
+          enabled: true
+          max-attempts: 5
+          initial-interval: 1s
+          multiplier: 2.0
+          max-interval: 30s
+
+app:
+  events:
+    relay:
+      enabled: true
+      poll-interval-ms: 1000
+      batch-size: 50
+  security:
+    jwt-secret: ${JWT_SECRET:dev-only-secret-change-me-minimum-32-bytes-long}
+    access-token-ttl: 15m
+    refresh-token-ttl: 7d
+    refresh-cookie-secure: true
+
+  notifications:
+    email:
+      enabled: true
+      poll-interval-ms: 5000
+      batch-size: 20
+      from: noreply@logistics.local
+  proof:
+    otp-pepper: ${OTP_PEPPER:dev-only-otp-pepper-change-me-0123456789}
+    evidence-url-secret: ${EVIDENCE_URL_SECRET:dev-only-evidence-url-secret-change-me-0123}
+    otp-ttl: 10m
+    otp-max-attempts: 5
+    otp-issue-limit: 3
+    otp-issue-window: 10m
+    evidence-url-ttl: 120s
+    mail-from: noreply@logistics.local
+
+logging:
+  pattern:
+    level: "%5p [%X{correlationId:-}]"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  health:
+    mail:
+      enabled: false

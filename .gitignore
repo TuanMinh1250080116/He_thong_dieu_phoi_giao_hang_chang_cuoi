@@ -1,0 +1,17 @@
+backend/target/
+backend/.mvn/wrapper/maven-wrapper.jar
+backend/HELP.md
+frontend/build/
+frontend/.dart_tool/
+frontend/.flutter-plugins-dependencies
+frontend/android/local.properties
+frontend/android/.gradle/
+storage/
+uploads/
+*.log
+.idea/
+.vscode/
+*.iml
+.env
+.DS_Store
+Thumbs.db

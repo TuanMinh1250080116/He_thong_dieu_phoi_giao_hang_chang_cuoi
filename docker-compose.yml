@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: logistics
+      POSTGRES_USER: logistics
+      POSTGRES_PASSWORD: logistics
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: logistics
+      RABBITMQ_DEFAULT_PASS: logistics
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  mailhog:
+    image: mailhog/mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  pgdata:

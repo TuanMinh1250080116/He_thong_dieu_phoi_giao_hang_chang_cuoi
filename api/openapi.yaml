@@ -1,0 +1,5783 @@
+openapi: 3.0.3
+info:
+  title: Last-mile Delivery Dispatch API
+  version: 1.0.0
+  description: REST API của hệ thống điều phối giao hàng chặng cuối.
+servers:
+  - url: /api/v1
+tags:
+  - name: Auth
+    description: Sign in, refresh, sign out and the current user
+  - name: Orders
+    description: Customer orders and their lifecycle
+  - name: Dispatch
+    description: Batching, recommendation and driver assignment
+  - name: Delivery
+    description: Driver assignments and delivery execution
+  - name: Proof
+    description: Proof of delivery and evidence upload
+  - name: Notifications
+    description: In-app notifications
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in and receive an access token plus a refresh cookie
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Signed in. The refresh token is set as an HttpOnly cookie.
+          headers:
+            Set-Cookie:
+              description: refresh_token cookie (HttpOnly, SameSite=Strict, path /api/v1/auth)
+              schema:
+                type: string
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshSession
+      summary: Rotate the refresh token and get a new access token
+      security:
+        - refreshCookie: []
+      parameters:
+        - name: X-Requested-With
+          in: header
+          required: true
+          description: Must be `fetch`. Extra CSRF guard.
+          schema:
+            type: string
+            enum: [fetch]
+      responses:
+        '200':
+          description: New access token and a new refresh cookie. The old refresh token is revoked.
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke the current refresh session
+      responses:
+        '204':
+          description: Signed out. The refresh cookie is cleared.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /me:
+    get:
+      tags: [Auth]
+      operationId: getMe
+      summary: Profile, roles, permissions and zones of the signed-in user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /geo/geocode:
+    get:
+      tags: [Orders]
+      operationId: geocodeAddress
+      summary: Resolve an address to a point (needs order.create, dispatch.batch.manage or config.zone.manage)
+      description: Uses Nominatim when app.geocoding.enabled is true. 20 requests per minute per user.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 3
+            maxLength: 200
+      responses:
+        '200':
+          description: Point found
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lat, lng]
+                properties:
+                  lat:
+                    type: number
+                  lng:
+                    type: number
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          description: EXTERNAL_DEPENDENCY_UNAVAILABLE when address search is not enabled
+
+  /orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create an order (UC-01)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created
+          headers:
+            Location:
+              schema:
+                type: string
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List orders. Customers only see their own.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: zoneId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: q
+          in: query
+          description: Order code
+          schema:
+            type: string
+        - name: windowFrom
+          in: query
+          description: Only orders whose delivery window ends after this time
+          schema:
+            type: string
+            format: date-time
+        - name: windowTo
+          in: query
+          description: Only orders whose delivery window starts before this time
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of orders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /orders/{orderId}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Order detail
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Order
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Orders]
+      operationId: updateOrder
+      summary: Replace the editable content of a draft or ready order (UC-02). The zone is resolved again from the pickup point.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderRequest'
+      responses:
+        '200':
+          description: Updated order
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /orders/{orderId}/cancel:
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel an order (UC-03). The owner can cancel a draft or ready order; a reason is required once it is ready. Dispatch staff may cancel a ready order in their zone.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequest'
+      responses:
+        '200':
+          description: Cancelled order
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /orders/{orderId}/tracking:
+    get:
+      tags: [Orders]
+      operationId: getOrderTracking
+      summary: Customer-safe timeline of an order (UC-06). Internal reasons and audit details are never included.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Milestones, oldest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderTracking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders/{orderId}/submit:
+    post:
+      tags: [Orders]
+      operationId: submitOrder
+      summary: Move a draft order to READY_FOR_DISPATCH
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: Order is ready for dispatch
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /dispatch/batches:
+    get:
+      tags: [Dispatch]
+      operationId: listBatches
+      summary: Batches in the caller's zones, newest first (UC-08)
+      parameters:
+        - name: from
+          in: query
+          description: Start of the time range. On the board it narrows only the readyOrders panel (order window overlap). On lists it filters by creation time.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: End of the time range, must be after from.
+          schema:
+            type: string
+            format: date-time
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [DRAFT, LOCKED, COMPLETED, CANCELLED]
+        - name: zoneId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: q
+          in: query
+          description: Text search on codes (and driver name for deliveries)
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of batches
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchSummaryPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Dispatch]
+      operationId: createBatch
+      summary: Create a draft delivery batch from ready orders (UC-10)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBatchRequest'
+      responses:
+        '201':
+          description: Batch created in DRAFT
+          headers:
+            Location:
+              schema:
+                type: string
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /dispatch/board:
+    get:
+      tags: [Dispatch]
+      operationId: getDispatchBoard
+      summary: Dispatch board (UC-08). Eight panels of work that needs action. Poll every 15 seconds with If-None-Match.
+      parameters:
+        - name: zoneId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: q
+          in: query
+          description: Text search on codes (and driver name for deliveries)
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Start of the time range. On the board it narrows only the readyOrders panel (order window overlap). On lists it filters by creation time.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: End of the time range, must be after from.
+          schema:
+            type: string
+            format: date-time
+        - name: If-None-Match
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Panels as of now. The ETag changes only when panel content changes.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchBoard'
+        '304':
+          description: Nothing changed since the ETag the client sent
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /dispatch/deliveries:
+    get:
+      tags: [Dispatch]
+      operationId: monitorDeliveries
+      summary: Active delivery monitor (UC-37). Read-only; ACTIVE (default) means assigned, accepted, awaiting reassignment or in progress.
+      parameters:
+        - name: from
+          in: query
+          description: Start of the time range. On the board it narrows only the readyOrders panel (order window overlap). On lists it filters by creation time.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: End of the time range, must be after from.
+          schema:
+            type: string
+            format: date-time
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [ACTIVE, ASSIGNED, ACCEPTED, AWAITING_REASSIGNMENT, IN_PROGRESS, COMPLETED, CANCELLED]
+        - name: zoneId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: q
+          in: query
+          description: Text search on codes (and driver name for deliveries)
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of deliveries, newest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryMonitorPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /dispatch/batches/{batchId}:
+    get:
+      tags: [Dispatch]
+      operationId: getBatch
+      summary: Batch detail with totals and capabilities
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Batch
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /dispatch/batches/{batchId}/lock:
+    post:
+      tags: [Dispatch]
+      operationId: lockBatch
+      summary: Lock a draft batch (UC-12)
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '200':
+          description: Batch is LOCKED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          description: BATCH_LOCK_VALIDATION_FAILED. `details` lists invalid orders and capacity violations.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /dispatch/eligible-orders:
+    get:
+      tags: [Dispatch]
+      operationId: listEligibleOrders
+      summary: Orders that are ready for dispatch and can join a batch (UC-09)
+      description: Needs permission dispatch.batch.manage. Only READY_FOR_DISPATCH orders in the caller's zones are listed.
+      parameters:
+        - name: zoneId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: windowFrom
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: windowTo
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: One page of eligible orders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, asOf]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, code, zoneId, weightG, windowStart, windowEnd]
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        code:
+                          type: string
+                        zoneId:
+                          type: string
+                          format: uuid
+                        weightG:
+                          type: integer
+                        volumeCm3:
+                          type: integer
+                          format: int64
+                        windowStart:
+                          type: string
+                          format: date-time
+                        windowEnd:
+                          type: string
+                          format: date-time
+                        pickupAddress:
+                          type: string
+                        dropoffAddress:
+                          type: string
+                  nextCursor:
+                    type: string
+                    nullable: true
+                  asOf:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /dispatch/batches/{batchId}/membership:
+    post:
+      tags: [Dispatch]
+      operationId: changeBatchMembership
+      summary: Add or remove orders of a draft batch (UC-10, UC-11)
+      description: Only a DRAFT batch can change. A batch must keep at least one order. Every change bumps the batch version.
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                addOrderIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                removeOrderIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+      responses:
+        '200':
+          description: Updated batch
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /dispatch/batches/{batchId}/reopen:
+    post:
+      tags: [Dispatch]
+      operationId: reopenBatch
+      summary: Reopen a locked batch for editing (UC-38)
+      description: Needs permission dispatch.batch.manage. Refused with 409 once a driver is assigned. Active recommendations are invalidated.
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelDispatchRequest'
+      responses:
+        '200':
+          description: Updated batch
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /dispatch/batches/{batchId}/cancel:
+    post:
+      tags: [Dispatch]
+      operationId: cancelBatch
+      summary: Cancel a draft or locked batch and release its orders
+      description: Needs permission dispatch.cancel. Refused with 409 once a driver is assigned. Orders return to READY_FOR_DISPATCH.
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelDispatchRequest'
+      responses:
+        '200':
+          description: Updated batch
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /dispatch/batches/{batchId}/recommendations:
+    post:
+      tags: [Dispatch]
+      operationId: generateRecommendations
+      summary: Generate a ranked driver recommendation for a locked batch (UC-13)
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '201':
+          description: Snapshot created. `outcome` is RANKED or NO_ELIGIBLE_DRIVER; both are successes.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /dispatch/batches/{batchId}/recommendations/current:
+    get:
+      tags: [Dispatch]
+      operationId: getCurrentRecommendation
+      summary: Current snapshot of a batch with its server-computed effective status
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /dispatch/batches/{batchId}/decision:
+    get:
+      tags: [Dispatch]
+      operationId: getBatchDecision
+      summary: Current dispatch decision of a batch with its latest assignment
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Decision state; capabilities list the next dispatcher actions
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /dispatch/decisions/{decisionId}/assign:
+    post:
+      tags: [Dispatch]
+      operationId: assignRecommendedDriver
+      summary: Assign the top driver of a snapshot (UC-14), or override with another eligible driver (UC-15, needs dispatch.recommendation.override and a reason)
+      parameters:
+        - name: decisionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignRequest'
+      responses:
+        '200':
+          description: Assignment created in PENDING; driver reserved; delivery ASSIGNED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignmentEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VERSION_CONFLICT, RECOMMENDATION_EXPIRED, RECOMMENDATION_INVALIDATED, DRIVER_INELIGIBLE or ASSIGNMENT_CONFLICT
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /dispatch/decisions/{decisionId}/reassign:
+    post:
+      tags: [Dispatch]
+      operationId: reassignDriver
+      summary: Replace the driver of a decision after a rejection or before the delivery starts (UC-16)
+      parameters:
+        - name: decisionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReassignRequest'
+      responses:
+        '200':
+          description: New assignment in PENDING; the previous driver is released
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignmentEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /dispatch/decisions/{decisionId}/cancel:
+    post:
+      tags: [Dispatch]
+      operationId: cancelDispatch
+      summary: Cancel a dispatch decision; orders return to BATCHED, driver and vehicle are released (UC-17)
+      parameters:
+        - name: decisionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelDispatchRequest'
+      responses:
+        '200':
+          description: Decision CANCELLED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchCancelledEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /assignments/{assignmentId}/reject:
+    post:
+      tags: [Delivery]
+      operationId: rejectAssignment
+      summary: Driver rejects an assignment with a catalog reason (UC-20)
+      parameters:
+        - $ref: '#/components/parameters/AssignmentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RejectAssignmentRequest'
+      responses:
+        '200':
+          description: Assignment REJECTED; delivery waits for reassignment
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignmentEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /catalogs/rejection-reasons:
+    get:
+      tags: [Delivery]
+      operationId: listRejectionReasons
+      summary: Active rejection reasons a driver can pick from
+      responses:
+        '200':
+          description: Reasons
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RejectionReasonList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/roles/{roleCode}/permissions:
+    put:
+      tags: [Admin]
+      operationId: changeRolePermissions
+      summary: Replace the permissions of a role (needs iam.role.manage)
+      description: The system admin role must keep iam.user.manage and iam.role.manage. Every change is audited with before and after.
+      parameters:
+        - name: roleCode
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [permissionCodes, reason]
+              properties:
+                permissionCodes:
+                  type: array
+                  items:
+                    type: string
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Role with its new permissions
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/zones/{zoneId}/deactivate:
+    post:
+      tags: [Admin]
+      operationId: deactivateZone
+      summary: Stop using a zone so it no longer receives new orders (needs config.zone.manage)
+      description: Refused with 409 while the zone still has open orders (READY_FOR_DISPATCH, BATCHED, ASSIGNED, IN_DELIVERY) or open batches (DRAFT, LOCKED). details lists blockingOrders and blockingBatches.
+      parameters:
+        - name: zoneId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: The zone, now inactive
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/zones/{zoneId}/activate:
+    post:
+      tags: [Admin]
+      operationId: activateZoneState
+      summary: Use a stopped zone again (needs config.zone.manage)
+      parameters:
+        - name: zoneId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: The zone, now active
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /me/deliveries:
+    get:
+      tags: [Delivery]
+      operationId: listMyDeliveries
+      summary: Deliveries of the signed-in driver with batch, zone, stop count and open exceptions
+      parameters:
+        - name: status
+          in: query
+          description: Repeatable. ASSIGNED, ACCEPTED, AWAITING_REASSIGNMENT, IN_PROGRESS, COMPLETED or CANCELLED.
+          schema:
+            type: array
+            items:
+              type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: One page, newest first
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /me/deliveries/{deliveryId}:
+    get:
+      tags: [Delivery]
+      operationId: getMyDeliveryOverview
+      summary: Overview of one delivery of the signed-in driver, with stops, vehicle and assignment state
+      parameters:
+        - name: deliveryId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Delivery overview
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /me/assignments:
+    get:
+      tags: [Delivery]
+      operationId: listMyAssignments
+      summary: Assignments of the signed-in driver
+      responses:
+        '200':
+          description: Assignments
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignmentPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /assignments/{assignmentId}/accept:
+    post:
+      tags: [Delivery]
+      operationId: acceptAssignment
+      summary: Driver accepts an assignment (UC-19)
+      parameters:
+        - $ref: '#/components/parameters/AssignmentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: Assignment and delivery are ACCEPTED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignmentEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /deliveries/{deliveryId}:
+    get:
+      tags: [Delivery]
+      operationId: getDelivery
+      summary: Delivery with stops, progress and capabilities
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      responses:
+        '200':
+          description: Delivery
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /deliveries/{deliveryId}/start:
+    post:
+      tags: [Delivery]
+      operationId: startDelivery
+      summary: Start an accepted delivery (UC-21). Snapshots the effective POD policy.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: Delivery is IN_PROGRESS
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /deliveries/{deliveryId}/stops/{stopId}/actions:
+    post:
+      tags: [Delivery]
+      operationId: updateStop
+      summary: Move a stop through its states (UC-22). There is no COMPLETE action because a stop completes when its POD is valid.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+        - $ref: '#/components/parameters/StopId'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StopActionRequest'
+      responses:
+        '200':
+          description: Stop updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /deliveries/{deliveryId}/complete:
+    post:
+      tags: [Delivery]
+      operationId: completeDelivery
+      summary: Complete a delivery (UC-24)
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: Delivery COMPLETED, orders DELIVERED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: COMPLETION_PREREQUISITES_MISSING (details list incomplete stops, missing POD and blocking exceptions), VERSION_CONFLICT or STATE_TRANSITION_NOT_ALLOWED
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+
+  /deliveries/{deliveryId}/evidence-uploads:
+    post:
+      tags: [Proof]
+      operationId: prepareEvidenceUpload
+      summary: Ask for a short-lived upload URL for a photo or signature
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvidenceUploadRequest'
+      responses:
+        '201':
+          description: Upload slot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceUploadResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /evidence/{evidenceId}/content:
+    put:
+      tags: [Proof]
+      operationId: uploadEvidenceContent
+      summary: Upload the image bytes to the slot returned by evidence-uploads. Used by the local storage adapter.
+      parameters:
+        - name: evidenceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
+          image/png:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '204':
+          description: Stored
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+
+  /evidence/{evidenceId}/complete:
+    post:
+      tags: [Proof]
+      operationId: completeEvidenceUpload
+      summary: Tell the server the upload finished so it can verify size, type and owner
+      parameters:
+        - name: evidenceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvidenceCompleteRequest'
+      responses:
+        '200':
+          description: Evidence status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+
+  /deliveries/{deliveryId}/stops/{stopId}/pod:
+    post:
+      tags: [Proof]
+      operationId: submitPod
+      summary: Submit proof of delivery for a stop (UC-25). The server sets the timestamp.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+        - $ref: '#/components/parameters/StopId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitPodRequest'
+      responses:
+        '201':
+          description: POD created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodEnvelope'
+        '200':
+          description: Same Idempotency-Key replayed; the existing POD is returned
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          description: POD_POLICY_NOT_SATISFIED (details.missing lists the evidence still needed), EVIDENCE_INVALID or OTP_INVALID_OR_EXPIRED (the challenge is not verified for this stop or was already used)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /pods/{podId}:
+    get:
+      tags: [Proof]
+      operationId: getPod
+      summary: View a POD within the caller's scope. OTP is only shown as VERIFIED or NOT_VERIFIED.
+      parameters:
+        - name: podId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: POD
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /deliveries/{deliveryId}/stops/{stopId}/otp-challenges:
+    post:
+      tags: [Proof]
+      operationId: issueOtp
+      summary: Email a one-time code to the recipient (UC-25). The code is never returned.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+        - $ref: '#/components/parameters/StopId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Challenge issued; any earlier active challenge for the stop is expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OtpIssued'
+        '200':
+          description: Same Idempotency-Key replayed; no second email is sent
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OtpIssued'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /otp-challenges/{challengeId}/verify:
+    post:
+      tags: [Proof]
+      operationId: verifyOtp
+      summary: Verify the code the recipient reads out. Five wrong tries lock the challenge.
+      parameters:
+        - name: challengeId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OtpVerifyRequest'
+      responses:
+        '200':
+          description: Verified
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challengeId, status]
+                properties:
+                  challengeId:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [VERIFIED]
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: OTP_INVALID_OR_EXPIRED
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '423':
+          $ref: '#/components/responses/Locked'
+
+  /orders/{orderId}/pod:
+    get:
+      tags: [Proof]
+      operationId: getOrderPod
+      summary: The proof of delivery of an order the caller may see (customer owner, dispatcher in scope, submitting driver)
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: POD
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /pods/{podId}/evidence/{evidenceId}/access:
+    post:
+      tags: [Proof]
+      operationId: grantEvidenceAccess
+      summary: Get a 120-second signed link to view one attached evidence file
+      parameters:
+        - name: podId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: evidenceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Link
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceAccess'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /evidence/view/{token}:
+    get:
+      tags: [Proof]
+      operationId: viewEvidence
+      summary: Stream the evidence file. The signed token is the credential, so no Authorization header is needed.
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The file
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /deliveries/{deliveryId}/exceptions:
+    post:
+      tags: [Exception]
+      operationId: reportException
+      summary: Report a delivery problem (UC-23). Types that block a stop need stopId and move that stop to BLOCKED.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReportExceptionRequest'
+      responses:
+        '201':
+          description: Exception created in OPEN
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /exceptions:
+    get:
+      tags: [Exception]
+      operationId: listExceptions
+      summary: Exception queue (UC-32). Operations managers and dispatchers see their zones; a driver sees the problems on their own deliveries.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [OPEN, INVESTIGATING, RESOLVED, CANCELLED]
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: assigneeId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: blocking
+          in: query
+          schema:
+            type: boolean
+        - name: deliveryId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /exceptions/{exceptionId}:
+    get:
+      tags: [Exception]
+      operationId: getException
+      summary: Exception detail with timeline and the actions the caller may take
+      parameters:
+        - name: exceptionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Detail
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /exceptions/{exceptionId}/notes:
+    post:
+      tags: [Exception]
+      operationId: addExceptionNote
+      summary: Add context to an open exception without changing its state
+      parameters:
+        - name: exceptionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExceptionNoteRequest'
+      responses:
+        '201':
+          description: Note added
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /exceptions/{exceptionId}/investigate:
+    post:
+      tags: [Exception]
+      operationId: investigateException
+      summary: Operations manager takes the case, moving it from OPEN to INVESTIGATING (UC-33)
+      parameters:
+        - name: exceptionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvestigateExceptionRequest'
+      responses:
+        '200':
+          description: Exception is INVESTIGATING
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /exceptions/{exceptionId}/resolve:
+    post:
+      tags: [Exception]
+      operationId: resolveException
+      summary: Resolve an investigated exception. Clears the blocking reference but never completes the delivery (UC-34).
+      parameters:
+        - name: exceptionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveExceptionRequest'
+      responses:
+        '200':
+          description: Exception is RESOLVED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /exceptions/{exceptionId}/cancel:
+    post:
+      tags: [Exception]
+      operationId: cancelException
+      summary: Cancel an invalid or duplicate report, only from OPEN (UC-34)
+      parameters:
+        - name: exceptionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelExceptionRequest'
+      responses:
+        '200':
+          description: Exception is CANCELLED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionEnvelope'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /catalogs/exception-types:
+    get:
+      tags: [Exception]
+      operationId: listExceptionTypes
+      summary: Active exception types with their default severity and impact
+      responses:
+        '200':
+          description: Types
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExceptionTypeList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/users:
+    get:
+      tags: [Admin]
+      operationId: listUsers
+      summary: List users (UC-26)
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [ACTIVE, DISABLED, LOCKED]
+        - name: role
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Admin]
+      operationId: createUser
+      summary: Create a user with an initial password. Roles are assigned separately.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: User created
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/users/{userId}:
+    get:
+      tags: [Admin]
+      operationId: getUser
+      summary: User with roles and zone scopes
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    patch:
+      tags: [Admin]
+      operationId: updateUser
+      summary: Change the display name. Status and roles have their own endpoints.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/users/{userId}/disable:
+    post:
+      tags: [Admin]
+      operationId: disableUser
+      summary: Disable an account and revoke its sessions (AUTH-05). Not yourself, not the last admin.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/users/{userId}/enable:
+    post:
+      tags: [Admin]
+      operationId: enableUser
+      summary: Enable a disabled or locked account
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/users/{userId}/roles:
+    put:
+      tags: [Admin]
+      operationId: changeUserRoles
+      summary: Replace the roles and zone scopes of a user (AUTH-04). Audited as ROLE_CHANGED; not your own.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeRolesRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUser'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/roles:
+    get:
+      tags: [Admin]
+      operationId: listRoles
+      summary: Roles with their permission matrix
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRoleList'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/zone-options:
+    get:
+      tags: [Admin]
+      operationId: listZoneOptions
+      summary: Id, code and name of every active zone, for pickers. Needs config.zone.manage or iam.role.manage.
+      responses:
+        '200':
+          description: Zones
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, code, name]
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        code:
+                          type: string
+                        name:
+                          type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/zones:
+    get:
+      tags: [Admin]
+      operationId: listZones
+      summary: Zones the caller manages, with the active version
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZoneList'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Admin]
+      operationId: createZone
+      summary: Create a zone. The creator is given scope over it.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateZoneRequest'
+      responses:
+        '201':
+          description: Zone created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Zone'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/zones/{zoneId}/versions:
+    get:
+      tags: [Admin]
+      operationId: listZoneVersions
+      summary: Versions of a zone, newest first
+      parameters:
+        - name: zoneId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZoneVersionList'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Admin]
+      operationId: createZoneVersion
+      summary: Add a draft boundary (GeoJSON Polygon or MultiPolygon, SRID 4326). Invalid geometry returns the reason.
+      parameters:
+        - name: zoneId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateZoneVersionRequest'
+      responses:
+        '201':
+          description: Draft version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZoneVersion'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/zone-versions/{versionId}/activate:
+    post:
+      tags: [Admin]
+      operationId: activateZoneVersion
+      summary: Activate a draft. The previous version is retired. Overlapping an active zone returns 409 with details.overlappingZoneIds.
+      parameters:
+        - name: versionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZoneVersion'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/dispatch-rules:
+    get:
+      tags: [Admin]
+      operationId: listDispatchRules
+      summary: Dispatch rule versions visible to the caller
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [DRAFT, SCHEDULED, ACTIVE, RETIRED, CANCELLED]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchRuleList'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Admin]
+      operationId: createDispatchRule
+      summary: Create a draft rule version. Weights must sum to exactly 1; ttlSeconds 60 to 900.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDispatchRuleRequest'
+      responses:
+        '201':
+          description: Draft version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchRuleVersion'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/dispatch-rules/{ruleId}/unschedule:
+    post:
+      tags: [Admin]
+      operationId: unscheduleDispatchRule
+      summary: Cancel the schedule of a SCHEDULED rule version
+      parameters:
+        - name: ruleId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The version, back to DRAFT
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/pod-policies/{policyId}/unschedule:
+    post:
+      tags: [Admin]
+      operationId: unschedulePodPolicy
+      summary: Cancel the schedule of a SCHEDULED POD policy version
+      parameters:
+        - name: policyId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The version, back to DRAFT
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/dispatch-rules/{ruleId}/activate:
+    post:
+      tags: [Admin]
+      operationId: activateDispatchRule
+      summary: Activate a draft; the previous version of the same scope is retired (audit DISPATCH_RULE_CHANGED).
+      parameters:
+        - name: ruleId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                effectiveFrom:
+                  type: string
+                  format: date-time
+                  description: Optional. A time at least one minute and at most one year ahead schedules the version (status SCHEDULED) instead of activating it now.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchRuleVersion'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/pod-policies:
+    get:
+      tags: [Admin]
+      operationId: listPodPolicies
+      summary: POD policy versions visible to the caller
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [DRAFT, SCHEDULED, ACTIVE, RETIRED, CANCELLED]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodPolicyList'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Admin]
+      operationId: createPodPolicy
+      summary: Create a draft POD policy version
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePodPolicyRequest'
+      responses:
+        '201':
+          description: Draft version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodPolicyVersion'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/pod-policies/{policyId}/activate:
+    post:
+      tags: [Admin]
+      operationId: activatePodPolicy
+      summary: Activate a draft; deliveries started later snapshot it, running ones keep theirs.
+      parameters:
+        - name: policyId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                effectiveFrom:
+                  type: string
+                  format: date-time
+                  description: Optional. A time at least one minute and at most one year ahead schedules the version (status SCHEDULED) instead of activating it now.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodPolicyVersion'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/vehicles:
+    get:
+      tags: [Fleet]
+      operationId: listVehicles
+      summary: List vehicles (UC-28)
+      parameters:
+        - name: active
+          in: query
+          schema:
+            type: boolean
+        - name: q
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehiclePage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Fleet]
+      operationId: createVehicle
+      summary: Create a vehicle. The code is upper-cased and must be unique.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VehicleRequest'
+      responses:
+        '201':
+          description: Vehicle created
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vehicle'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/vehicles/{id}:
+    get:
+      tags: [Fleet]
+      operationId: getVehicle
+      summary: Vehicle detail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vehicle'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    patch:
+      tags: [Fleet]
+      operationId: updateVehicle
+      summary: Change type, capacity or note. The code never changes.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VehicleRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vehicle'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/vehicles/{id}/deactivate:
+    post:
+      tags: [Fleet]
+      operationId: deactivateVehicle
+      summary: Deactivate; refused with details.blockingAssignmentIds while its driver has an open assignment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vehicle'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/vehicles/{id}/activate:
+    post:
+      tags: [Fleet]
+      operationId: activateVehicle
+      summary: Activate a vehicle again
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vehicle'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/driver-candidates:
+    get:
+      tags: [Fleet]
+      operationId: listDriverCandidates
+      summary: Active accounts with the DRIVER role that have no driver profile yet
+      responses:
+        '200':
+          description: Candidates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [userId, email, displayName]
+                      properties:
+                        userId:
+                          type: string
+                          format: uuid
+                        email:
+                          type: string
+                        displayName:
+                          type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/drivers:
+    get:
+      tags: [Fleet]
+      operationId: listDrivers
+      summary: List drivers that serve the caller's zones, plus drivers without a zone (UC-27)
+      parameters:
+        - name: active
+          in: query
+          schema:
+            type: boolean
+        - name: q
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DriverPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Fleet]
+      operationId: createDriver
+      summary: Create a driver profile for an account that has the DRIVER role
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DriverRequest'
+      responses:
+        '201':
+          description: Driver created
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Driver'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/drivers/{id}:
+    get:
+      tags: [Fleet]
+      operationId: getDriver
+      summary: Driver detail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Driver'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    patch:
+      tags: [Fleet]
+      operationId: updateDriver
+      summary: Change name, contact, vehicle and zones. A vehicle can belong to one driver only.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DriverRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Driver'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/drivers/{id}/deactivate:
+    post:
+      tags: [Fleet]
+      operationId: deactivateDriver
+      summary: Deactivate; refused with details.blockingAssignmentIds while an assignment is open. Forces OFFLINE.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Driver'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/drivers/{id}/activate:
+    post:
+      tags: [Fleet]
+      operationId: activateDriver
+      summary: Activate a driver again
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Driver'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /me/driver:
+    get:
+      tags: [Fleet]
+      operationId: getMyDriver
+      summary: The signed-in driver with availability, vehicle, last location and pending assignments (UC-35)
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DriverSelf'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /me/driver/availability:
+    put:
+      tags: [Fleet]
+      operationId: changeMyAvailability
+      summary: Go online or offline. RESERVED and BUSY are set by the system; with an open obligation the answer is 409.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailabilityRequest'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DriverSelf'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /me/driver/location:
+    put:
+      tags: [Fleet]
+      operationId: updateMyLocation
+      summary: Report the current position. At most 6 per minute per driver, then 429 with Retry-After. The server sets recordedAt.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LocationRequest'
+      responses:
+        '204':
+          description: Stored
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      summary: In-app notifications of the signed-in user
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of notifications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/unread-count:
+    get:
+      tags: [Notifications]
+      operationId: getUnreadNotificationCount
+      summary: Number of unread in-app notifications. A hint only, not the source of truth for tasks.
+      responses:
+        '200':
+          description: Count
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count]
+                properties:
+                  count:
+                    type: integer
+                    minimum: 0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /audit-records:
+    get:
+      tags: [Audit]
+      operationId: searchAuditRecords
+      summary: Search the audit trail (UC-31). Read-only. from and to are required and may span at most 92 days.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: actorId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: entityType
+          in: query
+          schema:
+            type: string
+        - name: entityId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: correlationId
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Newest first. Records are limited to the caller's zones; records without a zone are visible to the system admin only.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /audit-records/{auditId}:
+    get:
+      tags: [Audit]
+      operationId: getAuditRecord
+      summary: One audit record with its sanitized before and after state
+      parameters:
+        - name: auditId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Record
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditRecord'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notifications/read-all:
+    post:
+      tags: [Notification]
+      operationId: markAllNotificationsRead
+      summary: Mark every in-app notification of the caller as read. Safe to repeat.
+      responses:
+        '204':
+          description: Done
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/{notificationId}/read:
+    post:
+      tags: [Notifications]
+      operationId: markNotificationRead
+      summary: Mark one notification as read. Safe to repeat.
+      parameters:
+        - name: notificationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Marked as read
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+
+  headers:
+    ETag:
+      description: Current version of the resource. Send it back as If-Match on the next command.
+      schema:
+        type: string
+    CorrelationId:
+      description: Request correlation ID, also present in logs, audit and events.
+      schema:
+        type: string
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+    IdempotentReplayed:
+      description: "`true` when the stored result of an earlier identical request is returned."
+      schema:
+        type: string
+        enum: ['true']
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 8 to 128 printable characters, a UUID is recommended. Reuse it only to retry the same request, within 24 hours.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Version received in the last ETag, for example `"3"`. Missing gives 428, outdated gives 409 VERSION_CONFLICT.
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from `nextCursor`. Only valid with the same filters.
+      schema:
+        type: string
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    BatchId:
+      name: batchId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    AssignmentId:
+      name: assignmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DeliveryId:
+      name: deliveryId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    StopId:
+      name: stopId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    ValidationError:
+      description: VALIDATION_ERROR. `errors` lists the failing fields.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: AUTHENTICATION_REQUIRED or AUTHENTICATION_FAILED
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: FORBIDDEN or ACCOUNT_DISABLED
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: RESOURCE_NOT_FOUND. Also returned when the resource exists but is outside the caller's scope.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: A business conflict. Tell them apart by `code`, not by status.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: The request is well formed but breaks a business rule.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PreconditionRequired:
+      description: PRECONDITION_REQUIRED. The If-Match header is missing.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Locked:
+      description: ACCOUNT_LOCKED after too many wrong passwords
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: RATE_LIMITED
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unavailable:
+      description: EXTERNAL_DEPENDENCY_UNAVAILABLE. Retry with the same Idempotency-Key.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_ERROR
+        - AUTHENTICATION_REQUIRED
+        - AUTHENTICATION_FAILED
+        - ACCOUNT_LOCKED
+        - ACCOUNT_DISABLED
+        - FORBIDDEN
+        - RESOURCE_NOT_FOUND
+        - PRECONDITION_REQUIRED
+        - VERSION_CONFLICT
+        - STATE_TRANSITION_NOT_ALLOWED
+        - IDEMPOTENCY_KEY_REUSED
+        - IDEMPOTENCY_IN_PROGRESS
+        - ORDER_ALREADY_IN_ACTIVE_BATCH
+        - ASSIGNMENT_CONFLICT
+        - DRIVER_INELIGIBLE
+        - RECOMMENDATION_EXPIRED
+        - RECOMMENDATION_INVALIDATED
+        - ZONE_UNRESOLVED
+        - BATCH_LOCK_VALIDATION_FAILED
+        - COMPLETION_PREREQUISITES_MISSING
+        - POD_POLICY_NOT_SATISFIED
+        - OTP_INVALID_OR_EXPIRED
+        - OTP_LOCKED
+        - EVIDENCE_INVALID
+        - UPLOAD_FAILED
+        - RATE_LIMITED
+        - EXTERNAL_DEPENDENCY_UNAVAILABLE
+        - UNEXPECTED_FAILURE
+
+    FieldError:
+      type: object
+      required: [field, code, message]
+      properties:
+        field:
+          type: string
+          description: JSON path of the request field, or the header name
+        code:
+          type: string
+        message:
+          type: string
+
+    Problem:
+      type: object
+      required: [type, title, status, code, correlationId, retryable]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        correlationId:
+          type: string
+        retryable:
+          type: boolean
+        currentVersion:
+          type: integer
+          format: int64
+          description: Only on VERSION_CONFLICT
+        errors:
+          type: array
+          description: Only on VALIDATION_ERROR
+          items:
+            $ref: '#/components/schemas/FieldError'
+        details:
+          type: object
+          additionalProperties: true
+          description: Safe details for the caller's scope
+
+    Capability:
+      type: string
+      enum:
+        - canEditOrder
+        - canCancelOrder
+        - canLockBatch
+        - canReopenBatch
+        - canGenerateRecommendation
+        - canAssign
+        - canOverrideRecommendation
+        - canReassign
+        - canCancelDispatch
+        - canAcceptAssignment
+        - canRejectAssignment
+        - canStartDelivery
+        - canSubmitPod
+        - canCompleteDelivery
+        - canResumeStop
+        - canInvestigateException
+        - canResolveException
+        - canCancelException
+
+    Capabilities:
+      type: array
+      description: Actions allowed right now. For rendering only; the server checks again.
+      items:
+        $ref: '#/components/schemas/Capability'
+
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat:
+          type: number
+          minimum: -90
+          maximum: 90
+        lng:
+          type: number
+          minimum: -180
+          maximum: 180
+
+    TimeWindow:
+      type: object
+      required: [start, end]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+
+    LoginRequest:
+      type: object
+      required: [identifier, password]
+      properties:
+        identifier:
+          type: string
+          description: Email
+        password:
+          type: string
+          format: password
+
+    UserSummary:
+      type: object
+      required: [id, email, displayName, roles]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        displayName:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [CUSTOMER, DISPATCHER, DRIVER, OPS_MANAGER, SYSTEM_ADMIN]
+
+    AuthResponse:
+      type: object
+      required: [accessToken, expiresIn, user]
+      properties:
+        accessToken:
+          type: string
+        expiresIn:
+          type: integer
+          description: Seconds until the access token expires
+        user:
+          $ref: '#/components/schemas/UserSummary'
+
+    MeResponse:
+      type: object
+      required: [id, email, displayName, roles, permissions, scopeZoneIds]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        displayName:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+        permissions:
+          type: array
+          items:
+            type: string
+          description: Codes such as dispatch.assign
+        scopeZoneIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    OrderStatus:
+      type: string
+      enum: [DRAFT, READY_FOR_DISPATCH, BATCHED, ASSIGNED, IN_DELIVERY, DELIVERED, CANCELLED]
+
+    AddressInput:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+        point:
+          $ref: '#/components/schemas/GeoPoint'
+
+    PackageInput:
+      type: object
+      required: [weightG]
+      properties:
+        weightG:
+          type: integer
+          minimum: 1
+        lengthCm:
+          type: integer
+          minimum: 1
+        widthCm:
+          type: integer
+          minimum: 1
+        heightCm:
+          type: integer
+          minimum: 1
+        note:
+          type: string
+
+    CreateOrderRequest:
+      type: object
+      required: [saveMode, pickup, dropoff, recipient, package, timeWindow]
+      properties:
+        saveMode:
+          type: string
+          enum: [DRAFT, SUBMIT]
+        pickup:
+          $ref: '#/components/schemas/AddressInput'
+        dropoff:
+          $ref: '#/components/schemas/AddressInput'
+        recipient:
+          type: object
+          required: [name]
+          properties:
+            name:
+              type: string
+            contact:
+              type: string
+        package:
+          $ref: '#/components/schemas/PackageInput'
+        timeWindow:
+          $ref: '#/components/schemas/TimeWindow'
+
+    UpdateOrderRequest:
+      type: object
+      required: [pickup, dropoff, recipient, package, timeWindow]
+      properties:
+        pickup:
+          $ref: '#/components/schemas/AddressInput'
+        dropoff:
+          $ref: '#/components/schemas/AddressInput'
+        recipient:
+          type: object
+          required: [name]
+          properties:
+            name:
+              type: string
+            contact:
+              type: string
+        package:
+          $ref: '#/components/schemas/PackageInput'
+        timeWindow:
+          $ref: '#/components/schemas/TimeWindow'
+
+    CancelOrderRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Required unless the order is still a draft
+
+    OrderTracking:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [milestone, occurredAt]
+            properties:
+              milestone:
+                type: string
+                enum: [ORDER_RECEIVED, BATCHED, DRIVER_ASSIGNED, REASSIGNING, OUT_FOR_DELIVERY, DELIVERY_ISSUE, DELIVERED, ORDER_CANCELLED]
+              occurredAt:
+                type: string
+                format: date-time
+              note:
+                type: string
+                nullable: true
+
+    OrderDetail:
+      type: object
+      required: [id, code, status, pickup, dropoff, recipient, package, timeWindow, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        pickup:
+          $ref: '#/components/schemas/AddressInput'
+        dropoff:
+          $ref: '#/components/schemas/AddressInput'
+        recipient:
+          type: object
+          properties:
+            name:
+              type: string
+            contact:
+              type: string
+              description: Partly masked unless the caller may see it
+        package:
+          $ref: '#/components/schemas/PackageInput'
+        timeWindow:
+          $ref: '#/components/schemas/TimeWindow'
+        zoneId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set by the server, never sent by the client
+        version:
+          type: integer
+          format: int64
+        cancelReason:
+          type: string
+          nullable: true
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    OrderEnvelope:
+      type: object
+      required: [data, version, capabilities]
+      properties:
+        data:
+          $ref: '#/components/schemas/OrderDetail'
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    OrderPage:
+      type: object
+      required: [items, nextCursor, asOf]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderDetail'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    CreateBatchRequest:
+      type: object
+      required: [zoneId, orderIds]
+      properties:
+        zoneId:
+          type: string
+          format: uuid
+        orderIds:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: string
+            format: uuid
+
+    BatchStatus:
+      type: string
+      enum: [DRAFT, LOCKED, COMPLETED, CANCELLED]
+
+    BatchDetail:
+      type: object
+      required: [id, code, zoneId, status, orderCount, totalWeightG, totalVolumeCm3, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        zoneId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+        orderCount:
+          type: integer
+          minimum: 0
+          maximum: 50
+        totalWeightG:
+          type: integer
+          format: int64
+        totalVolumeCm3:
+          type: integer
+          format: int64
+        plannedWindow:
+          type: object
+          nullable: true
+          required: [start, end]
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        orderIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        decisionId:
+          type: string
+          format: uuid
+          nullable: true
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    BatchEnvelope:
+      type: object
+      required: [data, version, capabilities]
+      properties:
+        data:
+          $ref: '#/components/schemas/BatchDetail'
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    CandidateBreakdown:
+      type: object
+      required: [distance, capacityFit, availability, zoneCompatibility]
+      properties:
+        distance:
+          type: number
+          minimum: 0
+          maximum: 100
+        capacityFit:
+          type: number
+          minimum: 0
+          maximum: 100
+        availability:
+          type: number
+          minimum: 0
+          maximum: 100
+        zoneCompatibility:
+          type: number
+          minimum: 0
+          maximum: 100
+
+    RecommendationCandidate:
+      type: object
+      required: [rank, driverId, totalScore, distanceM, distanceBasis, breakdown]
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+        driverId:
+          type: string
+          format: uuid
+        driverName:
+          type: string
+        vehicle:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            type:
+              type: string
+        totalScore:
+          type: number
+        distanceM:
+          type: number
+        distanceBasis:
+          type: string
+          enum: [GEODESIC]
+          description: Straight-line distance, not driving distance
+        breakdown:
+          $ref: '#/components/schemas/CandidateBreakdown'
+
+    RecommendationSnapshot:
+      type: object
+      required: [id, status, effectiveStatus, generatedAt, expiresAt, ruleVersion, candidateCount, eligibleCount, outcome, candidates]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [ACTIVE, CONSUMED, EXPIRED, INVALIDATED]
+        effectiveStatus:
+          type: string
+          enum: [ACTIVE, CONSUMED, EXPIRED, INVALIDATED]
+          description: Computed by the server. The client must not derive it from its own clock.
+        generatedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        ruleVersion:
+          type: object
+          required: [id, versionNo]
+          properties:
+            id:
+              type: string
+              format: uuid
+            versionNo:
+              type: integer
+        candidateCount:
+          type: integer
+          minimum: 0
+        eligibleCount:
+          type: integer
+          minimum: 0
+        exclusionSummary:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Number of drivers excluded per reason code
+        outcome:
+          type: string
+          enum: [RANKED, NO_ELIGIBLE_DRIVER]
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecommendationCandidate'
+
+    RecommendationEnvelope:
+      type: object
+      required: [data, version, capabilities]
+      properties:
+        data:
+          type: object
+          required: [decisionId, snapshot]
+          properties:
+            decisionId:
+              type: string
+              format: uuid
+            snapshot:
+              $ref: '#/components/schemas/RecommendationSnapshot'
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    AssignRequest:
+      type: object
+      required: [snapshotId]
+      properties:
+        snapshotId:
+          type: string
+          format: uuid
+        driverId:
+          type: string
+          format: uuid
+          description: Omit for the top recommendation. Any other eligible driver is an override and needs overrideReason.
+        overrideReason:
+          type: string
+
+    DecisionEnvelope:
+      type: object
+      required: [data, version]
+      properties:
+        data:
+          type: object
+          properties:
+            decisionId:
+              type: string
+              format: uuid
+            status:
+              type: string
+              enum: [PENDING_DECISION, AWAITING_DRIVER_RESPONSE, CONFIRMED, AWAITING_REASSIGNMENT, CANCELLED]
+            assignment:
+              type: object
+              nullable: true
+              properties:
+                id:
+                  type: string
+                  format: uuid
+                status:
+                  $ref: '#/components/schemas/AssignmentStatus'
+                kind:
+                  type: string
+                driverId:
+                  type: string
+                  format: uuid
+                driverName:
+                  type: string
+                rejectionReasonCode:
+                  type: string
+                  nullable: true
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    ReassignRequest:
+      type: object
+      required: [driverId, reason]
+      properties:
+        driverId:
+          type: string
+          format: uuid
+        reason:
+          type: string
+
+    CancelDispatchRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+
+    RejectAssignmentRequest:
+      type: object
+      required: [reasonCode]
+      properties:
+        reasonCode:
+          type: string
+        description:
+          type: string
+          description: Required when the chosen reason has requiresDescription = true (OTHER)
+
+    RejectionReason:
+      type: object
+      required: [code, requiresDescription]
+      properties:
+        code:
+          type: string
+        requiresDescription:
+          type: boolean
+
+    RejectionReasonList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RejectionReason'
+
+    DispatchCancelledEnvelope:
+      type: object
+      required: [data, version]
+      properties:
+        data:
+          type: object
+          properties:
+            decisionId:
+              type: string
+              format: uuid
+            status:
+              type: string
+              enum: [CANCELLED]
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    AssignmentStatus:
+      type: string
+      enum: [PENDING, ACCEPTED, REJECTED, CANCELLED, SUPERSEDED]
+
+    AssignmentDetail:
+      type: object
+      required: [id, decisionId, deliveryId, driverId, status, kind]
+      properties:
+        id:
+          type: string
+          format: uuid
+        decisionId:
+          type: string
+          format: uuid
+        deliveryId:
+          type: string
+          format: uuid
+        driverId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/AssignmentStatus'
+        kind:
+          type: string
+          enum: [ACCEPT_RECOMMENDATION, OVERRIDE, REASSIGN]
+        version:
+          type: integer
+          format: int64
+          description: Version of the dispatch decision; send it as If-Match when accepting
+
+    AssignmentEnvelope:
+      type: object
+      required: [data, version, capabilities]
+      properties:
+        data:
+          $ref: '#/components/schemas/AssignmentDetail'
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    AssignmentPage:
+      type: object
+      required: [items, nextCursor, asOf]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AssignmentDetail'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    DeliveryStatus:
+      type: string
+      enum: [ASSIGNED, ACCEPTED, AWAITING_REASSIGNMENT, IN_PROGRESS, COMPLETED, CANCELLED]
+
+    StopStatus:
+      type: string
+      enum: [PENDING, IN_PROGRESS, COMPLETED, BLOCKED, SKIPPED]
+
+    DeliveryStop:
+      type: object
+      required: [id, orderId, sequence, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        sequence:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/StopStatus'
+        address:
+          type: string
+        arrivedAt:
+          type: string
+          format: date-time
+          nullable: true
+        podRequired:
+          type: array
+          items:
+            type: string
+            enum: [OTP, PHOTO, SIGNATURE]
+        podSubmitted:
+          type: boolean
+
+    BlockedBy:
+      type: object
+      required: [capability, reason]
+      properties:
+        capability:
+          $ref: '#/components/schemas/Capability'
+        reason:
+          type: string
+        refs:
+          type: array
+          items:
+            type: string
+
+    DeliveryDetail:
+      type: object
+      required: [id, batchId, status, stops, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        batchId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/DeliveryStatus'
+        driverId:
+          type: string
+          format: uuid
+        stops:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeliveryStop'
+        completedStops:
+          type: integer
+          minimum: 0
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+        blockedBy:
+          type: array
+          items:
+            $ref: '#/components/schemas/BlockedBy'
+
+    DeliveryEnvelope:
+      type: object
+      required: [data, version, capabilities]
+      properties:
+        data:
+          $ref: '#/components/schemas/DeliveryDetail'
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    StopActionRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [START_STOP, MARK_ARRIVED, MARK_READY_FOR_POD, RESUME_AFTER_EXCEPTION, REQUEST_SKIP]
+
+    EvidenceUploadRequest:
+      type: object
+      required: [purpose, kind, mimeType, sizeBytes]
+      properties:
+        purpose:
+          type: string
+          enum: [POD, EXCEPTION]
+        kind:
+          type: string
+          enum: [PHOTO, SIGNATURE]
+        stopId:
+          type: string
+          format: uuid
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+          minimum: 1
+
+    EvidenceUploadResponse:
+      type: object
+      required: [evidenceId, uploadUrl, method, expiresAt]
+      properties:
+        evidenceId:
+          type: string
+          format: uuid
+        uploadUrl:
+          type: string
+        method:
+          type: string
+          enum: [PUT]
+        requiredHeaders:
+          type: object
+          additionalProperties:
+            type: string
+        expiresAt:
+          type: string
+          format: date-time
+
+    EvidenceCompleteRequest:
+      type: object
+      required: [sha256]
+      properties:
+        sha256:
+          type: string
+          pattern: '^[A-Fa-f0-9]{64}$'
+
+    EvidenceStatus:
+      type: object
+      required: [evidenceId, status]
+      properties:
+        evidenceId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [PENDING, VERIFIED, QUARANTINED, ATTACHED]
+
+    SubmitPodRequest:
+      type: object
+      required: [gps]
+      properties:
+        gps:
+          type: object
+          required: [point, accuracyM]
+          properties:
+            point:
+              $ref: '#/components/schemas/GeoPoint'
+            accuracyM:
+              type: number
+              minimum: 0
+        isDirectHandoff:
+          type: boolean
+        recipientName:
+          type: string
+        evidenceIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        otpChallengeId:
+          type: string
+          format: uuid
+        note:
+          type: string
+
+    PodSummary:
+      type: object
+      required: [id, stopId, capturedAt, gpsConfirmed, evidenceTypes, otpStatus]
+      properties:
+        id:
+          type: string
+          format: uuid
+        stopId:
+          type: string
+          format: uuid
+        capturedAt:
+          type: string
+          format: date-time
+          description: Set by the server
+        recipientName:
+          type: string
+        gpsConfirmed:
+          type: boolean
+        evidenceTypes:
+          type: array
+          items:
+            type: string
+            enum: [OTP, PHOTO, SIGNATURE]
+        otpStatus:
+          type: string
+          enum: [VERIFIED, NOT_VERIFIED]
+        evidence:
+          type: array
+          description: Attached evidence; ask for a short-lived link with the access endpoint
+          items:
+            type: object
+            required: [id, kind]
+            properties:
+              id:
+                type: string
+                format: uuid
+              kind:
+                type: string
+                enum: [PHOTO, SIGNATURE]
+
+    ExceptionStatus:
+      type: string
+      enum: [OPEN, INVESTIGATING, RESOLVED, CANCELLED]
+
+    ExceptionImpact:
+      type: string
+      enum: [NON_BLOCKING, BLOCKS_STOP, BLOCKS_DELIVERY_COMPLETION, CUSTOMER_IMPACTING]
+
+    UserRef:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+
+    ReportExceptionRequest:
+      type: object
+      required: [type, description]
+      properties:
+        type:
+          type: string
+        description:
+          type: string
+        stopId:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+          description: Only an operations manager may change the type default
+        evidenceIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Verified evidence uploaded with purpose EXCEPTION
+
+    InvestigateExceptionRequest:
+      type: object
+      required: [assigneeId, note]
+      properties:
+        assigneeId:
+          type: string
+          format: uuid
+        note:
+          type: string
+
+    ResolveExceptionRequest:
+      type: object
+      required: [outcome, note]
+      properties:
+        outcome:
+          type: string
+          enum: [RESUME_DELIVERY, REATTEMPT_LATER, RETURN_TO_SENDER, NO_ACTION_NEEDED]
+        note:
+          type: string
+
+    CancelExceptionRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+
+    ExceptionNoteRequest:
+      type: object
+      required: [body]
+      properties:
+        body:
+          type: string
+
+    ExceptionNote:
+      type: object
+      required: [id, type, body, author, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [CONTEXT, INVESTIGATION, RESOLUTION]
+        body:
+          type: string
+        author:
+          $ref: '#/components/schemas/UserRef'
+        createdAt:
+          type: string
+          format: date-time
+
+    ExceptionSummary:
+      type: object
+      required: [id, code, deliveryId, deliveryCode, type, severity, impact, blocking, status, description, reporter, reportedAt, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        deliveryId:
+          type: string
+          format: uuid
+        deliveryCode:
+          type: string
+        stopId:
+          type: string
+          format: uuid
+          nullable: true
+        stopStatus:
+          type: string
+          nullable: true
+        orderId:
+          type: string
+          format: uuid
+          nullable: true
+        type:
+          type: object
+          required: [code, name]
+          properties:
+            code:
+              type: string
+            name:
+              type: string
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        impact:
+          $ref: '#/components/schemas/ExceptionImpact'
+        blocking:
+          type: boolean
+        status:
+          $ref: '#/components/schemas/ExceptionStatus'
+        description:
+          type: string
+        reporter:
+          $ref: '#/components/schemas/UserRef'
+        assignee:
+          type: object
+          nullable: true
+          required: [id, name]
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+        reportedAt:
+          type: string
+          format: date-time
+        investigatingAt:
+          type: string
+          format: date-time
+          nullable: true
+        closedAt:
+          type: string
+          format: date-time
+          nullable: true
+        resolutionOutcome:
+          type: string
+          nullable: true
+        resolutionNote:
+          type: string
+          nullable: true
+        cancellationReason:
+          type: string
+          nullable: true
+        version:
+          type: integer
+          format: int64
+
+    ExceptionDetail:
+      allOf:
+        - $ref: '#/components/schemas/ExceptionSummary'
+        - type: object
+          properties:
+            notes:
+              type: array
+              items:
+                $ref: '#/components/schemas/ExceptionNote'
+            evidenceIds:
+              type: array
+              items:
+                type: string
+                format: uuid
+
+    ExceptionEnvelope:
+      type: object
+      required: [data, version]
+      properties:
+        data:
+          $ref: '#/components/schemas/ExceptionDetail'
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    ExceptionPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExceptionSummary'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    ExceptionTypeList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [code, name, defaultSeverity, impact]
+            properties:
+              code:
+                type: string
+              name:
+                type: string
+              defaultSeverity:
+                type: string
+                enum: [LOW, MEDIUM, HIGH, CRITICAL]
+              impact:
+                $ref: '#/components/schemas/ExceptionImpact'
+
+    AuditRecord:
+      type: object
+      required: [id, occurredAt, actor, action, entityType, entityId, correlationId]
+      properties:
+        id:
+          type: string
+          format: uuid
+        occurredAt:
+          type: string
+          format: date-time
+        actor:
+          type: object
+          required: [type]
+          properties:
+            id:
+              type: string
+              format: uuid
+              nullable: true
+            name:
+              type: string
+              nullable: true
+            type:
+              type: string
+              enum: [USER, SYSTEM]
+        action:
+          type: string
+        entityType:
+          type: string
+        entityId:
+          type: string
+          format: uuid
+        zoneId:
+          type: string
+          format: uuid
+          nullable: true
+        before:
+          type: object
+          nullable: true
+          additionalProperties: true
+        after:
+          type: object
+          nullable: true
+          additionalProperties: true
+        reason:
+          type: string
+          nullable: true
+        correlationId:
+          type: string
+
+    AuditPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditRecord'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    CreateUserRequest:
+      type: object
+      required: [email, displayName, password]
+      properties:
+        email:
+          type: string
+        username:
+          type: string
+          nullable: true
+          description: Optional sign-in name, 3 to 32 of a-z 0-9 . _ - (stored lowercase).
+        displayName:
+          type: string
+        phone:
+          type: string
+          nullable: true
+          description: Optional, 8 to 15 digits, may start with +.
+        password:
+          type: string
+          description: At least 10 characters with letters and digits. Never returned.
+
+    UpdateUserRequest:
+      type: object
+      required: [displayName]
+      properties:
+        username:
+          type: string
+          nullable: true
+          description: Optional sign-in name, 3 to 32 of a-z 0-9 . _ - (stored lowercase).
+        displayName:
+          type: string
+        phone:
+          type: string
+          nullable: true
+          description: Replaces the stored phone; null or blank clears it.
+
+    ReasonRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+
+    ChangeRolesRequest:
+      type: object
+      required: [roleCodes, reason]
+      properties:
+        roleCodes:
+          type: array
+          items:
+            type: string
+        scopeZoneIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        reason:
+          type: string
+
+    AdminUser:
+      type: object
+      required: [id, email, displayName, status, roles, scopeZoneIds, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        username:
+          type: string
+          nullable: true
+          description: Optional sign-in name, 3 to 32 of a-z 0-9 . _ - (stored lowercase).
+        displayName:
+          type: string
+        phone:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED, LOCKED]
+        roles:
+          type: array
+          items:
+            type: string
+        scopeZoneIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          format: int64
+
+    AdminUserPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminUser'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    AdminRoleList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [code, permissions]
+            properties:
+              code:
+                type: string
+              permissions:
+                type: array
+                items:
+                  type: string
+
+    CreateZoneRequest:
+      type: object
+      required: [code, name]
+      properties:
+        code:
+          type: string
+          description: 2 to 32 characters, capital letters, digits, dash or underscore
+        name:
+          type: string
+
+    Zone:
+      type: object
+      required: [id, code, name, active, versionCount]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name:
+          type: string
+        active:
+          type: boolean
+        activeVersionNo:
+          type: integer
+          nullable: true
+        activeVersionId:
+          type: string
+          format: uuid
+          nullable: true
+        versionCount:
+          type: integer
+
+    ZoneList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Zone'
+
+    CreateZoneVersionRequest:
+      type: object
+      required: [boundary]
+      properties:
+        boundary:
+          type: object
+          description: GeoJSON Polygon or MultiPolygon, longitude then latitude
+          additionalProperties: true
+
+    ZoneVersion:
+      type: object
+      required: [id, zoneId, versionNo, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        zoneId:
+          type: string
+          format: uuid
+        versionNo:
+          type: integer
+        status:
+          type: string
+          enum: [DRAFT, ACTIVE, RETIRED, CANCELLED]
+        effectiveFrom:
+          type: string
+          format: date-time
+          nullable: true
+        activatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        retiredAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    ZoneVersionList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ZoneVersion'
+
+    RuleWeights:
+      type: object
+      required: [distance, capacityFit, availability, zoneCompat]
+      properties:
+        distance:
+          type: number
+        capacityFit:
+          type: number
+        availability:
+          type: number
+        zoneCompat:
+          type: number
+
+    CreateDispatchRuleRequest:
+      type: object
+      required: [name, weights, ttlSeconds, searchRadiusM, maxLocationAgeSeconds, persistTopN]
+      properties:
+        zoneId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Omit for the default rule
+        name:
+          type: string
+        weights:
+          $ref: '#/components/schemas/RuleWeights'
+        ttlSeconds:
+          type: integer
+          minimum: 60
+          maximum: 900
+        searchRadiusM:
+          type: integer
+        maxLocationAgeSeconds:
+          type: integer
+        persistTopN:
+          type: integer
+          minimum: 1
+          maximum: 200
+
+    DispatchRuleVersion:
+      type: object
+      required: [id, versionNo, name, status, weights, ttlSeconds]
+      properties:
+        id:
+          type: string
+          format: uuid
+        zoneId:
+          type: string
+          format: uuid
+          nullable: true
+        versionNo:
+          type: integer
+        name:
+          type: string
+        status:
+          type: string
+          enum: [DRAFT, SCHEDULED, ACTIVE, RETIRED, CANCELLED]
+        weights:
+          $ref: '#/components/schemas/RuleWeights'
+        ttlSeconds:
+          type: integer
+        searchRadiusM:
+          type: integer
+        maxLocationAgeSeconds:
+          type: integer
+        persistTopN:
+          type: integer
+        effectiveFrom:
+          type: string
+          format: date-time
+        activatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        retiredAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    DispatchRuleList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DispatchRuleVersion'
+
+    EvidenceExpression:
+      type: object
+      required: [op, items]
+      properties:
+        op:
+          type: string
+          enum: [ANY_OF, ALL_OF]
+        items:
+          type: array
+          items:
+            type: string
+            enum: [OTP, PHOTO, SIGNATURE]
+
+    CreatePodPolicyRequest:
+      type: object
+      required: [name, evidenceExpression, recipientNameRule]
+      properties:
+        zoneId:
+          type: string
+          format: uuid
+          nullable: true
+        name:
+          type: string
+        evidenceExpression:
+          $ref: '#/components/schemas/EvidenceExpression'
+        maxGpsAccuracyM:
+          type: integer
+          nullable: true
+        recipientNameRule:
+          type: string
+          enum: [ALWAYS, DIRECT_HANDOFF, NEVER]
+
+    PodPolicyVersion:
+      type: object
+      required: [id, versionNo, name, status, evidenceExpression]
+      properties:
+        id:
+          type: string
+          format: uuid
+        zoneId:
+          type: string
+          format: uuid
+          nullable: true
+        versionNo:
+          type: integer
+        name:
+          type: string
+        status:
+          type: string
+          enum: [DRAFT, SCHEDULED, ACTIVE, RETIRED, CANCELLED]
+        evidenceExpression:
+          $ref: '#/components/schemas/EvidenceExpression'
+        requiresGps:
+          type: boolean
+        requiresServerTimestamp:
+          type: boolean
+        maxGpsAccuracyM:
+          type: integer
+          nullable: true
+        recipientNameRule:
+          type: string
+        effectiveFrom:
+          type: string
+          format: date-time
+        activatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        retiredAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    PodPolicyList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PodPolicyVersion'
+
+    BoardPanel:
+      type: object
+      required: [count, items]
+      properties:
+        count:
+          type: integer
+          description: Total matching, even when items is capped
+        items:
+          type: array
+          description: At most 10 items; keys depend on the panel
+          items:
+            type: object
+            additionalProperties: true
+
+    DispatchBoard:
+      type: object
+      required: [panels, asOf]
+      properties:
+        panels:
+          type: object
+          required: [readyOrders, draftBatches, lockedWithoutRecommendation, expiredRecommendations, awaitingDriverResponse, awaitingReassignment, activeDeliveries, openExceptions]
+          properties:
+            readyOrders:
+              $ref: '#/components/schemas/BoardPanel'
+            draftBatches:
+              $ref: '#/components/schemas/BoardPanel'
+            lockedWithoutRecommendation:
+              $ref: '#/components/schemas/BoardPanel'
+            expiredRecommendations:
+              $ref: '#/components/schemas/BoardPanel'
+            awaitingDriverResponse:
+              $ref: '#/components/schemas/BoardPanel'
+            awaitingReassignment:
+              $ref: '#/components/schemas/BoardPanel'
+            activeDeliveries:
+              $ref: '#/components/schemas/BoardPanel'
+            openExceptions:
+              $ref: '#/components/schemas/BoardPanel'
+        asOf:
+          type: string
+          format: date-time
+
+    BatchSummary:
+      type: object
+      required: [id, code, zoneId, status, orderCount, version, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        zoneId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+        orderCount:
+          type: integer
+        totalWeightG:
+          type: integer
+          format: int64
+        totalVolumeCm3:
+          type: integer
+          format: int64
+        plannedStart:
+          type: string
+          format: date-time
+          nullable: true
+        plannedEnd:
+          type: string
+          format: date-time
+          nullable: true
+        decisionStatus:
+          type: string
+          nullable: true
+          enum: [PENDING_DECISION, AWAITING_DRIVER_RESPONSE, CONFIRMED, AWAITING_REASSIGNMENT]
+        version:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+
+    BatchSummaryPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchSummary'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    DeliveryMonitorItem:
+      type: object
+      required: [id, code, batchCode, status, driverName, completedStops, totalStops, openExceptionCount, customerImpacting]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        batchCode:
+          type: string
+        zoneId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/DeliveryStatus'
+        driverId:
+          type: string
+          format: uuid
+        driverName:
+          type: string
+        orderCount:
+          type: integer
+        completedStops:
+          type: integer
+        totalStops:
+          type: integer
+        lastUpdateAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        openExceptionCount:
+          type: integer
+        customerImpacting:
+          type: boolean
+
+    DeliveryMonitorPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeliveryMonitorItem'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    VehicleRequest:
+      type: object
+      required: [vehicleType, capacityWeightG, capacityVolumeCm3]
+      properties:
+        code:
+          type: string
+          description: Needed on create, ignored on update
+        vehicleType:
+          type: string
+        capacityWeightG:
+          type: integer
+        capacityVolumeCm3:
+          type: integer
+          format: int64
+        note:
+          type: string
+          nullable: true
+
+    Vehicle:
+      type: object
+      required: [id, code, vehicleType, capacityWeightG, capacityVolumeCm3, active, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        vehicleType:
+          type: string
+        capacityWeightG:
+          type: integer
+        capacityVolumeCm3:
+          type: integer
+          format: int64
+        active:
+          type: boolean
+        note:
+          type: string
+          nullable: true
+        version:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+
+    VehiclePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Vehicle'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    DriverRequest:
+      type: object
+      required: [fullName]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Needed on create, ignored on update
+        fullName:
+          type: string
+        contact:
+          type: string
+          nullable: true
+        vehicleId:
+          type: string
+          format: uuid
+          nullable: true
+        zoneIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    Driver:
+      type: object
+      required: [id, userId, code, fullName, active, availability, zoneIds, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        code:
+          type: string
+        fullName:
+          type: string
+        contact:
+          type: string
+          nullable: true
+        active:
+          type: boolean
+        availability:
+          type: string
+          enum: [OFFLINE, AVAILABLE, RESERVED, BUSY]
+        vehicle:
+          type: object
+          nullable: true
+          properties:
+            id:
+              type: string
+              format: uuid
+            code:
+              type: string
+            vehicleType:
+              type: string
+        zoneIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        version:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+
+    DriverPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Driver'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
+
+    DriverSelf:
+      allOf:
+        - $ref: '#/components/schemas/Driver'
+        - type: object
+          properties:
+            pendingAssignments:
+              type: integer
+            location:
+              type: object
+              nullable: true
+              properties:
+                lat:
+                  type: number
+                lng:
+                  type: number
+                accuracyM:
+                  type: number
+                recordedAt:
+                  type: string
+                  format: date-time
+
+    AvailabilityRequest:
+      type: object
+      required: [availability]
+      properties:
+        availability:
+          type: string
+          enum: [AVAILABLE, OFFLINE]
+
+    LocationRequest:
+      type: object
+      required: [point]
+      properties:
+        point:
+          $ref: '#/components/schemas/GeoPoint'
+        accuracyM:
+          type: number
+          minimum: 0
+
+    OtpIssued:
+      type: object
+      required: [challengeId, expiresAt, maxAttempts, channel]
+      properties:
+        challengeId:
+          type: string
+          format: uuid
+        expiresAt:
+          type: string
+          format: date-time
+        maxAttempts:
+          type: integer
+        channel:
+          type: string
+          enum: [EMAIL]
+
+    OtpVerifyRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+
+    EvidenceAccess:
+      type: object
+      required: [url, expiresAt]
+      properties:
+        url:
+          type: string
+          description: Signed path valid for 120 seconds. Not stored or logged by the server.
+        expiresAt:
+          type: string
+          format: date-time
+
+    PodEnvelope:
+      type: object
+      required: [data, version, capabilities]
+      properties:
+        data:
+          $ref: '#/components/schemas/PodSummary'
+        version:
+          type: integer
+          format: int64
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+
+    Notification:
+      type: object
+      required: [id, channel, status, title, body, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        channel:
+          type: string
+          enum: [IN_APP, EMAIL]
+        status:
+          type: string
+          enum: [PENDING, SENT, FAILED, READ]
+        title:
+          type: string
+        body:
+          type: string
+        relatedEntityType:
+          type: string
+        relatedEntityId:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        readAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    NotificationPage:
+      type: object
+      required: [items, nextCursor, asOf]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+        nextCursor:
+          type: string
+          nullable: true
+        asOf:
+          type: string
+          format: date-time
